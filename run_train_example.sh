@@ -1,6 +1,6 @@
 python train.py\
     --dataset 'mfeat-fourier'\
-    --num_real_samples -1 \
+    --num_real_samples 50 \
     --train_epochs 20\
     --context_size 0\
     --num_contexts 20\

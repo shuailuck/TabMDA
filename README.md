@@ -54,3 +54,21 @@ pip install -r requirements.txt
 cd TabPFN
 pip install -e .
 ```
+
+## Configuring the TabPFN weights
+
+TabMDA uses the TabPFN v1 checkpoint `prior_diff_real_checkpoint_n_0_epoch_42.cpkt` (~103 MB). The original download URL (a GitHub raw link) no longer exists, so the download location is now configurable via `tabpfn_config.json` at the repository root:
+
+```json
+{
+  "model_path": null,
+  "model_url": "https://huggingface.co/spaces/TabPFN/TabPFNPrediction/resolve/main/TabPFN/models_diff/prior_diff_real_checkpoint_n_0_epoch_42.cpkt"
+}
+```
+
+- **`model_url`** — where the checkpoint is downloaded from when it is not already present locally. The default points at a HuggingFace mirror of the TabPFN v1 weights.
+- **`model_path`** — if set to the path of a local `.cpkt` file, the checkpoint is loaded from there and no download happens. Useful if you already have the weights, or are offline.
+
+You can also override these without editing the file via the `TABPFN_MODEL_URL` / `TABPFN_MODEL_PATH` environment variables, or point the loader at a different config file with `TABPFN_CONFIG=/path/to/your.json`.
+
+> Note: only the TabPFN **v1** checkpoint works with this code. The newer TabPFN v2 weights (e.g. `tabpfn-v2-classifier.ckpt`) use a different architecture and cannot be loaded here.

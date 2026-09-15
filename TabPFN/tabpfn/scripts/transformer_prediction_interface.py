@@ -43,6 +43,29 @@ class CustomUnpickler(pickle.Unpickler):
             return super().find_class(module, name)
 
 
+DEFAULT_MODEL_URL = (
+    'https://huggingface.co/spaces/TabPFN/TabPFNPrediction/resolve/main/'
+    'TabPFN/models_diff/prior_diff_real_checkpoint_n_0_epoch_42.cpkt'
+)
+
+
+def _load_weight_settings():
+    """
+    Return (model_path, model_url) from the config file, falling back to the
+    TABPFN_MODEL_PATH / TABPFN_MODEL_URL environment variables and a default URL.
+    """
+    model_path = os.environ.get('TABPFN_MODEL_PATH')
+    model_url = os.environ.get('TABPFN_MODEL_URL')
+    try:
+        from tabpfn_config import load_tabpfn_config
+        config = load_tabpfn_config()
+        model_path = model_path or config.get('model_path')
+        model_url = model_url or config.get('model_url')
+    except Exception:
+        pass
+    return model_path, (model_url or DEFAULT_MODEL_URL)
+
+
 def load_model_workflow(i, e, add_name, base_path, device='cpu', eval_addition='', only_inference=True):
     """
     Workflow for loading a model and setting appropriate parameters for diffable hparam tuning.
@@ -74,26 +97,43 @@ def load_model_workflow(i, e, add_name, base_path, device='cpu', eval_addition='
             print('We have to download the TabPFN, as there is no checkpoint at ', model_path)
             print('It has about 100MB, so this might take a moment.')
             import requests
-            url = 'https://github.com/automl/TabPFN/raw/main/tabpfn/models_diff/prior_diff_real_checkpoint_n_0_epoch_42.cpkt'
+            _, url = _load_weight_settings()
             r = requests.get(url, allow_redirects=True)
+            r.raise_for_status()
+            content = r.content
+            stripped = content.lstrip()[:20].lower()
+            if stripped.startswith(b'<!doctype html') or stripped.startswith(b'<html'):
+                raise RuntimeError(
+                    f'Downloaded an HTML page instead of a checkpoint from {url}. '
+                    'The URL is likely wrong; set model_url or model_path in tabpfn_config.json.')
             os.makedirs(os.path.dirname(model_path), exist_ok=True)
-            open(model_path, 'wb').write(r.content)
+            open(model_path, 'wb').write(content)
         return model_file, model_path, results_file
 
-    model_file = None
-    if e == -1:
-        for e_ in range(100, -1, -1):
-            model_file_, model_path_, results_file_ = check_file(e_)
-            if model_file_ is not None:
-                e = e_
-                model_file, model_path, results_file = model_file_, model_path_, results_file_
-                break
-    else:
-        model_file, model_path, results_file = check_file(e)
+    explicit_model_path, _ = _load_weight_settings()
 
-    if model_file is None:
-        model_file, model_path, results_file = get_file(e)
-        raise Exception('No checkpoint found at ' + str(model_path))
+    if explicit_model_path:
+        # Load directly from the configured checkpoint file, skipping any download.
+        model_path = os.path.abspath(os.path.expanduser(explicit_model_path))
+        if not Path(model_path).is_file():
+            raise FileNotFoundError(f'Configured TabPFN checkpoint not found: {model_path}')
+        model_file = model_path
+        results_file = None
+    else:
+        model_file = None
+        if e == -1:
+            for e_ in range(100, -1, -1):
+                model_file_, model_path_, results_file_ = check_file(e_)
+                if model_file_ is not None:
+                    e = e_
+                    model_file, model_path, results_file = model_file_, model_path_, results_file_
+                    break
+        else:
+            model_file, model_path, results_file = check_file(e)
+
+        if model_file is None:
+            model_file, model_path, results_file = get_file(e)
+            raise Exception('No checkpoint found at ' + str(model_path))
 
     # print(f'Loading {model_file}')
     if only_inference:
