@@ -48,11 +48,18 @@ DEFAULT_MODEL_URL = (
     'TabPFN/models_diff/prior_diff_real_checkpoint_n_0_epoch_42.cpkt'
 )
 
+DEFAULT_MODEL_FILENAME = 'prior_diff_real_checkpoint_n_0_epoch_42.cpkt'
 
-def _load_weight_settings():
+
+def _load_weight_settings(base_path=None):
     """
-    Return (model_path, model_url) from the config file, falling back to the
-    TABPFN_MODEL_PATH / TABPFN_MODEL_URL environment variables and a default URL.
+    Return (model_path, model_url) resolved from, in order of priority, the
+    TABPFN_MODEL_PATH / TABPFN_MODEL_URL environment variables and the
+    tabpfn_config.json file.
+
+    When no explicit ``model_path`` is configured, the local ``models_diff``
+    checkpoint is used if it is present on disk; otherwise ``model_path`` stays
+    empty so the caller falls back to downloading via ``model_url``.
     """
     model_path = os.environ.get('TABPFN_MODEL_PATH')
     model_url = os.environ.get('TABPFN_MODEL_URL')
@@ -63,6 +70,10 @@ def _load_weight_settings():
         model_url = model_url or config.get('model_url')
     except Exception:
         pass
+    if not model_path and base_path is not None:
+        candidate = os.path.join(str(base_path), 'models_diff', DEFAULT_MODEL_FILENAME)
+        if Path(candidate).is_file():
+            model_path = candidate
     return model_path, (model_url or DEFAULT_MODEL_URL)
 
 
@@ -110,7 +121,7 @@ def load_model_workflow(i, e, add_name, base_path, device='cpu', eval_addition='
             open(model_path, 'wb').write(content)
         return model_file, model_path, results_file
 
-    explicit_model_path, _ = _load_weight_settings()
+    explicit_model_path, _ = _load_weight_settings(base_path)
 
     if explicit_model_path:
         # Load directly from the configured checkpoint file, skipping any download.

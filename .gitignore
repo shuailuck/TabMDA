@@ -8,6 +8,9 @@ notebooks/results_mnist/*
 notebooks/results_mnist_baselines/*
 wandb/*
 model_checkpoints/*.pt
+.vscode
+.claude
+**/__pycache__
 
 
 

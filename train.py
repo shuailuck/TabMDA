@@ -16,7 +16,7 @@ from dataset.pytorch_dataset import PytorchDataset
 
 from models.scikit_classifiers import create_scikit_classifier
 
-from utils import GLOBAL_SEED, set_seed, get_available_device, to_numpy
+from utils import GLOBAL_SEED, set_seed, get_available_device, to_numpy, smote_augmentation_classwise
 from sklearn.metrics import balanced_accuracy_score, accuracy_score
 
 logging.basicConfig(level=logging.INFO,
@@ -57,6 +57,8 @@ if __name__ == "__main__":
                         choices=[
                             "none",                 # Use the real samples directly (no augmentor model)
                             "tabmda_encoder",        # Use TabMDA either frozen, or fine-tuned without a downstream classifier
+                            "tabmda_embedding",      # Encode the real samples into the embedding space once (no context subsetting, no SMOTE)
+                            "smote",                 # Augment the real samples in the input space using SMOTE
                         ],
                         type=str,
                         help='Name of the model to use')
@@ -212,6 +214,13 @@ if __name__ == "__main__":
     # ====== ENCODER-SPECIFIC CHECKS ======
     if args.augmentor_model == "none":
         print(f"Training a {args.classifier_model} classifier on the original data.")
+    elif args.augmentor_model == "smote":
+        if args.classifier_model in NON_DIFFERENTIABLE_CLASSIFIERS:
+            print(f"=========================\n"
+                  f"Training a {args.classifier_model} classifier on the SMOTE-augmented data in the input space.\n"
+                  f"=========================")
+        else:
+            raise ValueError(f"smote is not compatible with classifier model {args.classifier_model}")
     elif args.augmentor_model == "tabmda_encoder":
         if args.freeze_encoder is None:
             args.freeze_encoder = True
@@ -224,6 +233,19 @@ if __name__ == "__main__":
                   f"=========================")
         else:
             raise ValueError(f"tabmda_encoder is not compatible with classifier model {args.classifier_model}")
+
+    elif args.augmentor_model == "tabmda_embedding":
+        if args.freeze_encoder is None:
+            args.freeze_encoder = True
+        assert args.freeze_encoder, f"tabmda_embedding requires the encoder to be frozen"
+
+        if args.classifier_model in NON_DIFFERENTIABLE_CLASSIFIERS:
+            print(f"=========================\n"
+                  f"Training a {args.classifier_model} classifier on the TabMDA embedding space (no augmentation).\n"
+                  f"The data is encoded once with the full training set as context (num_contexts=1).\n"
+                  f"=========================")
+        else:
+            raise ValueError(f"tabmda_embedding is not compatible with classifier model {args.classifier_model}")
 
     # ====== CONTEXT SUBSETTING CHECKS ======
     # ---- Train ----
@@ -291,7 +313,7 @@ if __name__ == "__main__":
 
 
     # ==== DECIDE TO AUGMENT THE DATASET OR NOT ====
-    if args.augmentor_model == 'tabmda_encoder' and args.when_to_augment_data=='once_at_initialisation':
+    if args.augmentor_model in ('tabmda_encoder', 'tabmda_embedding') and args.when_to_augment_data=='once_at_initialisation':
         TabMDA_model = construct_tabmda_model(classifier=None,
                                               freeze_encoder=True,
                                               device=device)
@@ -300,6 +322,13 @@ if __name__ == "__main__":
         X_train, y_train = torch.tensor(X_train, dtype=torch.float32).to(device), torch.tensor(y_train, dtype=torch.long).to(device)
         X_val, y_val = torch.tensor(X_val, dtype=torch.float32).to(device), torch.tensor(y_val, dtype=torch.long).to(device)
         X_test, y_test = torch.tensor(X_test, dtype=torch.float32).to(device), torch.tensor(y_test, dtype=torch.long).to(device)
+
+        # ==== For `tabmda_embedding`, encode once with the full training set as context (no augmentation) ====
+        if args.augmentor_model == 'tabmda_embedding':
+            args.num_contexts = 1
+            args.context_size = 1
+            args.num_contexts_val = 1
+            args.num_contexts_test = 1
 
         # ======= Encode the data =======
         X_train_enc, y_train_enc = TabMDA_model.encode_batch(
@@ -347,7 +376,27 @@ if __name__ == "__main__":
         train_data = PytorchDataset(x=X_train_enc, y=y_train_enc, x_context=X_train, y_context=y_train, device=device)
         val_data   = PytorchDataset(x=X_val_enc,   y=y_val_enc,   x_context=X_train, y_context=y_train, device=device)
         test_data  = PytorchDataset(x=X_test_enc,  y=y_test_enc,  x_context=X_train, y_context=y_train, device=device)
-    
+
+    elif args.augmentor_model == 'smote':
+        # ==== Augment the real training samples in the input space using SMOTE ====
+        X_train_t = torch.tensor(X_train, dtype=torch.float32).to(device)
+        y_train_t = torch.tensor(y_train, dtype=torch.long).to(device)
+
+        X_train_aug, y_train_aug = smote_augmentation_classwise(
+            X_train_t, y_train_t,
+            k=args.smote_k,
+            rounds=args.smote_rounds,
+        )
+
+        X_train_aug, y_train_aug = to_numpy(X_train_aug), to_numpy(y_train_aug)
+
+        print(f"[Data] Original train shape: {X_train.shape}")
+        print(f"[Data] SMOTE-augmented train shape: {X_train_aug.shape}")
+
+        train_data = PytorchDataset(x=X_train_aug, y=y_train_aug, x_context=X_train, y_context=y_train, device=device)
+        val_data   = PytorchDataset(x=X_val,       y=y_val,       x_context=X_train, y_context=y_train, device=device)
+        test_data  = PytorchDataset(x=X_test,      y=y_test,      x_context=X_train, y_context=y_train, device=device)
+
     else:
         train_data = PytorchDataset(x=X_train, y=y_train, x_context=X_train, y_context=y_train, device=device)
         val_data   = PytorchDataset(x=X_val,   y=y_val,   x_context=X_train, y_context=y_train, device=device)
@@ -372,7 +421,11 @@ if __name__ == "__main__":
 
         if args.augmentor_model == "none":
             pass
-        elif args.augmentor_model == "taics_encoder":
+        elif args.augmentor_model == "smote":
+            pass
+        elif args.augmentor_model == "tabmda_embedding":
+            pass
+        elif args.augmentor_model == "tabmda_encoder":
             
             # ==============================================================
             #          SCIKIT CLASSIFIER on TAICS ENCODER
@@ -387,7 +440,7 @@ if __name__ == "__main__":
                 case _:
                     raise ValueError(f"Aggregation method {args.aggregation_over_contexts_test} is not supported for test set.")
         else:
-            raise ValueError(f"The combination of TAICS model {args.augmentor_model} and classifier model {args.classifier_model} is not supported.")
+            raise ValueError(f"The combination of augmentor model {args.augmentor_model} and classifier model {args.classifier_model} is not supported.")
 
 
         # ==============================================================
