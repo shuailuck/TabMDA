@@ -11,6 +11,7 @@ model_checkpoints/*.pt
 .vscode
 .claude
 **/__pycache__
+results
 
 
 
