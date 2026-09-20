@@ -17,6 +17,7 @@ Output:
     - one grouped bar chart per dataset (x = n, grouped by arm, std error bars)
 """
 import argparse
+import glob
 import math
 import os
 
@@ -42,9 +43,8 @@ ARM_COLORS = {
 }
 
 
-def load(path):
-    """Return rows keyed (dataset, int(n), arm, cs, nc) -> list of (train, val, test)."""
-    rows = {}
+def load_tsv(path, rows):
+    """Append rows from a single TSV into `rows` (keyed like load())."""
     with open(path) as f:
         f.readline()
         for line in f:
@@ -57,6 +57,23 @@ def load(path):
             except ValueError:
                 continue
             rows.setdefault((dataset, int(n), arm, cs, nc), []).append((train, val, test))
+
+
+def load(path):
+    """Return rows keyed (dataset, int(n), arm, cs, nc) -> list of (train, val, test).
+
+    `path` may be a single TSV file or a directory of `*.tsv` files (one per
+    dataset, as produced by run_comparison.sh).
+    """
+    rows = {}
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.tsv")))
+        if not files:
+            raise SystemExit(f"no *.tsv files in {path}")
+        for f in files:
+            load_tsv(f, rows)
+    else:
+        load_tsv(path, rows)
     return rows
 
 
@@ -138,10 +155,14 @@ def draw_dataset(summary, chosen, dataset, ns, arms, metric, out_dir):
     x = np.arange(len(ns))
     width = 0.8 / len(arms)
 
+    # Real (none) is the baseline; other arms are shown as deltas relative to it.
+    # Values are scaled x100 to percent so bars are readable (avoids long decimal zeros).
+    real_means = [100 * summary[(dataset, n)]["none"][metric_mean] for n in ns]
+
     fig, ax = plt.subplots(figsize=(max(6, 2.2 * len(ns)), 6))
     for a_i, arm in enumerate(arms):
-        means = [summary[(dataset, n)][arm][metric_mean] for n in ns]
-        stds = [summary[(dataset, n)][arm][metric_std] for n in ns]
+        means = [100 * summary[(dataset, n)][arm][metric_mean] for n in ns]
+        stds = [100 * summary[(dataset, n)][arm][metric_std] for n in ns]
         offset = (a_i - (len(arms) - 1) / 2) * width
         ax.bar(x + offset, means, width, yerr=stds, capsize=3,
                label=ARM_DISPLAY.get(arm, arm), color=ARM_COLORS.get(arm),
@@ -149,15 +170,41 @@ def draw_dataset(summary, chosen, dataset, ns, arms, metric, out_dir):
 
     ax.set_xticks(x)
     ax.set_xticklabels([f"n={n}" for n in ns])
-    ax.set_ylabel(f"{metric} balanced accuracy")
+    ax.set_ylabel(f"{metric} balanced accuracy (%)")
     ax.set_title(f"{dataset} — {metric} balanced accuracy (mean +/- std over repeats)")
     ax.legend(title="arm", bbox_to_anchor=(1.02, 1), loc="upper left")
+
+    # ---- annotate delta vs Real for the other 3 arms ----
+    # (positive delta = better than Real, green; negative = worse, red)
+    for a_i, arm in enumerate(arms):
+        if arm == "none":
+            continue
+        offset = (a_i - (len(arms) - 1) / 2) * width
+        for j, n in enumerate(ns):
+            m = 100 * summary[(dataset, n)][arm][metric_mean]
+            delta = m - real_means[j]
+            color = "#2e7d32" if delta >= 0 else "#c62828"
+            ax.annotate(f"{delta:+.2f}",
+                        xy=(x[j] + offset, m),
+                        xytext=(0, 4), textcoords="offset points",
+                        ha="center", va="bottom", fontsize=8, color=color)
+
+    # ---- y-axis auto-scaled to the data (not anchored at 0) ----
+    all_means = [100 * summary[(dataset, n)][arm][metric_mean] for n in ns for arm in arms]
+    all_stds = [100 * summary[(dataset, n)][arm][metric_std] for n in ns for arm in arms]
+    lo = min(m - s for m, s in zip(all_means, all_stds))
+    hi = max(m + s for m, s in zip(all_means, all_stds))
+    span = hi - lo
+    if span <= 0:
+        span = abs(hi) or 1.0
+    pad = span * 0.15
+    ax.set_ylim(lo - pad, hi + pad)
 
     # Annotate the chosen encoder grid point per n.
     subtitle = "  |  ".join(
         f"n={n}: cs={chosen[(dataset, n)][1]}, nc={chosen[(dataset, n)][2]}" for n in ns
     )
-    ax.text(0.5, -0.16, f"Encoder selected by best mean val: {subtitle}",
+    ax.text(0.5, -0.10, f"Encoder selected by best mean val: {subtitle}",
             transform=ax.transAxes, ha="center", va="top", fontsize=8, color="gray")
 
     fig.tight_layout()
@@ -169,7 +216,8 @@ def draw_dataset(summary, chosen, dataset, ns, arms, metric, out_dir):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tsv", default=os.path.join(REPO_ROOT, "results", "results.tsv"))
+    ap.add_argument("--tsv", default=os.path.join(REPO_ROOT, "results"),
+                    help="TSV file OR directory of per-dataset *.tsv files")
     ap.add_argument("--metric", choices=["val", "test", "both"], default="both",
                     help="which metric to plot")
     ap.add_argument("--out-dir", default=os.path.join(REPO_ROOT, "results", "comparison"),

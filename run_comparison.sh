@@ -30,6 +30,9 @@
 #  All settings below can be overridden via environment variables, e.g.:
 #      DATASETS="vehicle texture" NUM_REAL_SAMPLES="50 100" REPEATS="0 1 2" bash run_comparison.sh
 #      CONTEXT_SIZES="0.5 0.9" NUM_CONTEXTS_GRID="5 20" bash run_comparison.sh
+#
+#  Per-dataset sample sizes (overrides DATASETS / NUM_REAL_SAMPLES):
+#      DATASET_CONFIGS="vehicle:20,50 texture:50,100,200" bash run_comparison.sh
 # ============================================================================
 
 set -uo pipefail
@@ -78,6 +81,34 @@ REPEATS="${REPEATS:-0 1 2 3 4 5 6 7 8 9}" # repeat ids (0..9), aggregated as mea
 DATASETS="${DATASETS:-qsar-biodeg vehicle texture steel-plates-fault MiceProtein mfeat-fourier}"
 NUM_REAL_SAMPLES="${NUM_REAL_SAMPLES:-50}"
 
+# Per-dataset sample sizes. Format: space-separated `dataset:n1,n2,...` entries.
+# When set, this takes precedence over DATASETS / NUM_REAL_SAMPLES. E.g.:
+#     DATASET_CONFIGS="vehicle:20,50 texture:50,100,200"
+DATASET_CONFIGS="${DATASET_CONFIGS:-}"
+
+
+# ---------------------------------------------------------------------------
+#  Build the (dataset, num_real_samples) work list
+# ---------------------------------------------------------------------------
+# Each entry is `dataset:n` (the n values are looped over later).
+WORK_ITEMS=""
+if [ -n "$DATASET_CONFIGS" ]; then
+    # Parse DATASET_CONFIGS into individual `dataset:n` items.
+    for spec in $DATASET_CONFIGS; do
+        d="${spec%%:*}"
+        ns="${spec#*:}"
+        for nrs in $(echo "$ns" | tr ',' ' '); do
+            WORK_ITEMS="$WORK_ITEMS $d:$nrs"
+        done
+    done
+else
+    for dataset in $DATASETS; do
+        for nrs in $NUM_REAL_SAMPLES; do
+            WORK_ITEMS="$WORK_ITEMS $dataset:$nrs"
+        done
+    done
+fi
+
 # ---------------------------------------------------------------------------
 #  The 4 comparison arms (order matters for readability of results)
 # ---------------------------------------------------------------------------
@@ -90,7 +121,9 @@ DRY_RUN="${DRY_RUN:-0}"
 # ---------------------------------------------------------------------------
 OUTPUT_DIR="${OUTPUT_DIR:-results}"
 LOGS_DIR="$OUTPUT_DIR/logs"
-RESULTS_FILE="${RESULTS_FILE:-$OUTPUT_DIR/results.tsv}"
+# Each dataset's parsed metrics go to a dedicated file: $OUTPUT_DIR/<dataset>.tsv
+RESULTS_INIT=""   # space-separated list of datasets whose header has been written
+RUN_DATASETS=""   # space-separated unique list of datasets actually run
 
 # ---------------------------------------------------------------------------
 #  Helpers
@@ -127,7 +160,7 @@ extract_metric() {
     grep -oE "$2': [0-9.eE+-]+" "$1" 2>/dev/null | head -1 | grep -oE "[0-9.eE+-]+$"
 }
 
-# Run a single experiment and record its metrics into RESULTS_FILE.
+# Run a single experiment and record its metrics into $OUTPUT_DIR/<dataset>.tsv.
 #   $1 = dataset, $2 = num_real_samples, $3 = repeat_id, $4 = arm
 #   $5 = context_size (grid arm only, else ""), $6 = num_contexts (grid arm only, else "")
 run_one() {
@@ -192,8 +225,9 @@ run_one() {
     test_acc=$(extract_metric "$log_file" "test/balanced_accuracy")
 
     if [ -n "$test_acc" ]; then
+        local out_file="$OUTPUT_DIR/${dataset}.tsv"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$dataset" "$nrs" "$arm" "$cs" "$nc" "$repeat" "$train_acc" "$val_acc" "$test_acc" >> "$RESULTS_FILE"
+            "$dataset" "$nrs" "$arm" "$cs" "$nc" "$repeat" "$train_acc" "$val_acc" "$test_acc" >> "$out_file"
     else
         fail "no metrics parsed from $log_file"
         FAILED=$((FAILED + 1))
@@ -207,8 +241,13 @@ run_one() {
 resolve_python
 log "python : ${PY_CMD[*]}"
 log "classifier: $CLASSIFIER_MODEL  |  wandb: $ENABLE_WANDB  |  dry-run: $DRY_RUN"
-log "datasets : $DATASETS"
-log "n_real   : $NUM_REAL_SAMPLES"
+if [ -n "$DATASET_CONFIGS" ]; then
+    log "datasets : (per-dataset) $DATASET_CONFIGS"
+else
+    log "datasets : $DATASETS"
+    log "n_real   : $NUM_REAL_SAMPLES"
+fi
+log "work items: $WORK_ITEMS"
 log "repeats  : $REPEATS"
 log "arms     : $ARMS"
 log "grid     : context_size=[$CONTEXT_SIZES]  x  num_contexts=[$NUM_CONTEXTS_GRID]"
@@ -216,38 +255,49 @@ echo
 
 if [ "$DRY_RUN" != "1" ]; then
     mkdir -p "$LOGS_DIR" "$OUTPUT_DIR"
-    printf 'dataset\tn\tarm\tcontext_size\tnum_contexts\trepeat\ttrain\tval\ttest\n' > "$RESULTS_FILE"
+    # Build the unique list of datasets that will actually run.
+    for item in $WORK_ITEMS; do
+        d="${item%%:*}"
+        case " $RUN_DATASETS " in
+            *" $d "*) ;;
+            *) RUN_DATASETS="$RUN_DATASETS $d" ;;
+        esac
+    done
+    # Fresh per-dataset results files (truncate existing, write header).
+    for d in $RUN_DATASETS; do
+        printf 'dataset\tn\tarm\tcontext_size\tnum_contexts\trepeat\ttrain\tval\ttest\n' > "$OUTPUT_DIR/${d}.tsv"
+    done
     log "writing per-run logs to $LOGS_DIR"
-    log "writing parsed metrics to $RESULTS_FILE"
+    log "writing parsed metrics to $OUTPUT_DIR/<dataset>.tsv"
     echo
 fi
 
 FAILED=0
 TOTAL=0
 
-for dataset in $DATASETS; do
-    for nrs in $NUM_REAL_SAMPLES; do
-        for repeat in $REPEATS; do
-            for arm in $ARMS; do
-                if [ "$arm" = "tabmda_encoder" ]; then
-                    # ==== Grid search over in-context subsetting ====
-                    for cs in $CONTEXT_SIZES; do
-                        for nc in $NUM_CONTEXTS_GRID; do
-                            TOTAL=$((TOTAL + 1))
-                            run_one "$dataset" "$nrs" "$repeat" "$arm" "$cs" "$nc"
-                        done
+for item in $WORK_ITEMS; do
+    dataset="${item%%:*}"
+    nrs="${item#*:}"
+    for repeat in $REPEATS; do
+        for arm in $ARMS; do
+            if [ "$arm" = "tabmda_encoder" ]; then
+                # ==== Grid search over in-context subsetting ====
+                for cs in $CONTEXT_SIZES; do
+                    for nc in $NUM_CONTEXTS_GRID; do
+                        TOTAL=$((TOTAL + 1))
+                        run_one "$dataset" "$nrs" "$repeat" "$arm" "$cs" "$nc"
                     done
-                else
-                    TOTAL=$((TOTAL + 1))
-                    run_one "$dataset" "$nrs" "$repeat" "$arm" "" ""
-                fi
-            done
+                done
+            else
+                TOTAL=$((TOTAL + 1))
+                run_one "$dataset" "$nrs" "$repeat" "$arm" "" ""
+            fi
         done
     done
 done
 
 log "done. total=$TOTAL  failed=$FAILED"
-log "raw results: $RESULTS_FILE"
+log "raw results: $OUTPUT_DIR/<dataset>.tsv"
 log "per-run logs: $LOGS_DIR"
 echo
 
@@ -255,9 +305,14 @@ echo
 #  Aggregate over repeats -> mean +/- std
 #  (tabmda_encoder: first select best grid point by mean val, then report it)
 # ---------------------------------------------------------------------------
-if [ "$DRY_RUN" != "1" ] && [ -s "$RESULTS_FILE" ]; then
-    log "aggregating over repeats (mean +/- sample std)..."
-    python - "$RESULTS_FILE" <<'PY'
+if [ "$DRY_RUN" != "1" ]; then
+    for d in $RUN_DATASETS; do
+        local_file="$OUTPUT_DIR/${d}.tsv"
+        if [ ! -s "$local_file" ]; then
+            continue
+        fi
+        log "aggregating over repeats (mean +/- sample std) for $d..."
+        python - "$local_file" <<'PY'
 import sys, math
 
 rows = {}
@@ -325,7 +380,8 @@ print()
 print("rep = number of successful repeats aggregated. std is sample std (ddof=1).")
 print("tabmda_encoder is grid-searched over CONTEXT_SIZES x NUM_CONTEXTS_GRID; the best setting is chosen by mean val balanced accuracy.")
 PY
-    echo
+        echo
+    done
 fi
 
 if [ "$FAILED" -ne 0 ]; then

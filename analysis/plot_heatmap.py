@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """Heatmap of tabmda_encoder test/val balanced accuracy over context_size x num_contexts."""
 import argparse
+import glob
 import os
 import numpy as np
 import matplotlib
@@ -10,8 +11,7 @@ import matplotlib.pyplot as plt
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def load(path):
-    rows = {}
+def load_tsv(path, rows):
     with open(path) as f:
         header = f.readline().rstrip("\n").split("\t")
         for line in f:
@@ -26,6 +26,18 @@ def load(path):
             except ValueError:
                 continue
             rows.setdefault((dataset, int(n), cs, nc), []).append((train, val, test))
+
+
+def load(path):
+    rows = {}
+    if os.path.isdir(path):
+        files = sorted(glob.glob(os.path.join(path, "*.tsv")))
+        if not files:
+            raise SystemExit(f"no *.tsv files in {path}")
+        for f in files:
+            load_tsv(f, rows)
+    else:
+        load_tsv(path, rows)
     return rows
 
 
@@ -89,7 +101,8 @@ def print_grid(rows, dataset, n):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--tsv", default=os.path.join(REPO_ROOT, "results", "results.tsv"))
+    ap.add_argument("--tsv", default=os.path.join(REPO_ROOT, "results"),
+                help="TSV file OR directory of per-dataset *.tsv files")
     ap.add_argument("--dataset", default=None)
     ap.add_argument("--n", type=int, default=None)
     ap.add_argument("--print-grid", action="store_true", help="also print the mean-value table")
