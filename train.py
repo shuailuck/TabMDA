@@ -94,6 +94,16 @@ if __name__ == "__main__":
                         type=int,
                         help='Number of contexts for train')
 
+    parser.add_argument('--self_context',       # How to treat a query row's own (x_i, y_i) when sampling its context
+                        default='random',
+                        choices=['random', 'exclude', 'include'],
+                        type=str,
+                        help='Whether an augmented sample may appear in its own context. '
+                             '"random": no constraint (current behaviour); '
+                             '"exclude": context strictly excludes the sample; '
+                             '"include": context always contains the sample. '
+                             'Only affects the train encoding (val/test use the full training set as context).')
+
     # ----- Test-time agumetnation -----
     parser.add_argument('--num_contexts_val',   # For validation
                         default=1,
@@ -335,7 +345,8 @@ if __name__ == "__main__":
             batch={"x": X_train,             "y": y_train,
                    "x_context": [X_train],   "y_context": [y_train]},
             context_subsetting_params={"num_contexts": args.num_contexts,
-                                       "context_size": args.context_size},
+                                       "context_size": args.context_size,
+                                       "self_context": args.self_context},
             smote_params=smote_params
         )
         X_val_enc, y_val_enc = TabMDA_model.encode_batch(
