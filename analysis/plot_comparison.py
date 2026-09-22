@@ -26,6 +26,8 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+from table_image import save_table_image
+
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 ARM_DISPLAY = {
@@ -136,6 +138,8 @@ def print_table(summary, chosen):
         for arm in arms:
             flat.append((dataset, n, arm_rank.get(arm, 99), arm, arms[arm]))
     flat.sort(key=lambda k: (k[0], k[1], k[2]))
+    table_headers = ["dataset", "n", "arm", "rep", "train", "val", "test"]
+    table_rows = []
     for dataset, n, _, arm, m in flat:
         label = ARM_DISPLAY.get(arm, arm)
         if arm == "tabmda_encoder":
@@ -145,7 +149,17 @@ def print_table(summary, chosen):
               f"{m['train_mean']:>9.4f}+-{m['train_std']:<7.4f}  "
               f"{m['val_mean']:>9.4f}+-{m['val_std']:<7.4f}  "
               f"{m['test_mean']:>9.4f}+-{m['test_std']:<7.4f}")
+        table_rows.append([
+            dataset,
+            str(n),
+            label,
+            str(m["n_rep"]),
+            f"{m['train_mean']:.4f}+-{m['train_std']:.4f}",
+            f"{m['val_mean']:.4f}+-{m['val_std']:.4f}",
+            f"{m['test_mean']:.4f}+-{m['test_std']:.4f}",
+        ])
     print()
+    return table_headers, table_rows
 
 
 def draw_dataset(summary, chosen, dataset, ns, arms, metric, out_dir):
@@ -232,7 +246,12 @@ def main():
     chosen = select_best_encoder(rows)
     summary = aggregate(rows, chosen)
 
-    print_table(summary, chosen)
+    table_headers, table_rows = print_table(summary, chosen)
+    save_table_image(
+        table_headers, table_rows,
+        title="4-way comparison (mean +/- std over repeats)",
+        path=os.path.join(args.out_dir, "table.png"),
+    )
 
     metrics = [m for m in (["val", "test"] if args.metric == "both" else [args.metric])]
     os.makedirs(args.out_dir, exist_ok=True)

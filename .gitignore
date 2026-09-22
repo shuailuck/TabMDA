@@ -12,6 +12,7 @@ model_checkpoints/*.pt
 .claude
 **/__pycache__
 results
+results_self_context
 
 
 
