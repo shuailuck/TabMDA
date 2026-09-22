@@ -18,6 +18,12 @@
 #  Results are parsed from each run and aggregated over repeats as
 #  MEAN +/- STD (sample std, ddof=1) of train/val/test balanced accuracy.
 #
+#  The self-context arms are GRID-SEARCHED over the in-context subsetting
+#  hyperparameters: for each (dataset, num_real_samples) every combination of
+#      context_size  in CONTEXT_SIZES    (default 0.5 0.7 0.9 1)
+#      num_contexts  in NUM_CONTEXTS_GRID (default 5 20 50)
+#  is run. Each (context_size, num_contexts) config is reported separately.
+#
 #  Usage:
 #      bash run_self_context.sh            # run everything with defaults
 #      DRY_RUN=1 bash run_self_context.sh  # print commands only, run nothing
@@ -25,6 +31,7 @@
 #  Settings can be overridden via environment variables (same as run_comparison.sh):
 #      DATASETS="vehicle texture" NUM_REAL_SAMPLES="50 100" REPEATS="0 1 2" bash run_self_context.sh
 #      DATASET_CONFIGS="vehicle:20,50 texture:50,100,200" bash run_self_context.sh
+#      CONTEXT_SIZES="0.5 0.9" NUM_CONTEXTS_GRID="5 20" bash run_self_context.sh
 # ============================================================================
 
 set -uo pipefail
@@ -40,9 +47,9 @@ PYTHON_BIN="${PYTHON_BIN:-}"
 # ---------------------------------------------------------------------------
 CLASSIFIER_MODEL="${CLASSIFIER_MODEL:-LogReg}"
 
-# Context subsetting hyperparameters (applied to all 3 arms identically).
-CONTEXT_SIZE="${CONTEXT_SIZE:-0.5}"
-NUM_CONTEXTS="${NUM_CONTEXTS:-20}"
+# Context subsetting hyperparameters (grid-applied to all 3 arms identically).
+CONTEXT_SIZES="${CONTEXT_SIZES:-0.5 0.7 0.9 1}"    # context size = proportion of train set
+NUM_CONTEXTS_GRID="${NUM_CONTEXTS_GRID:-5 20 50}" # number of subcontexts per sample
 
 NUM_CONTEXTS_VAL="${NUM_CONTEXTS_VAL:-1}"
 NUM_CONTEXTS_TEST="${NUM_CONTEXTS_TEST:-1}"
@@ -128,20 +135,20 @@ extract_metric() {
 
 # Run a single experiment and record its metrics into $OUTPUT_DIR/<dataset>.tsv.
 run_one() {
-    local dataset="$1" nrs="$2" repeat="$3" arm="$4"
+    local dataset="$1" nrs="$2" repeat="$3" arm="$4" cs="$5" nc="$6"
 
-    log "== [$TOTAL] dataset=$dataset  n=$nrs  repeat=$repeat  self_context=$arm =="
+    log "== [$TOTAL] dataset=$dataset  n=$nrs  repeat=$repeat  self_context=$arm  cs=$cs  nc=$nc =="
 
     if [ "$DRY_RUN" = "1" ]; then
         echo "   ${PY_CMD[*]} train.py --dataset \"$dataset\" --num_real_samples $nrs \
 --repeat_id $repeat --classifier_model $CLASSIFIER_MODEL --augmentor_model tabmda_encoder \
---context_size $CONTEXT_SIZE --num_contexts $NUM_CONTEXTS \
+--context_size $cs --num_contexts $nc \
 --num_contexts_val $NUM_CONTEXTS_VAL --num_contexts_test $NUM_CONTEXTS_TEST \
 --aggregation_over_contexts_test $AGGREGATION_TEST --self_context $arm"
         return 0
     fi
 
-    local log_file="$LOGS_DIR/${dataset}_n${nrs}_r${repeat}_selfctx_${arm}.log"
+    local log_file="$LOGS_DIR/${dataset}_n${nrs}_r${repeat}_selfctx_${arm}_cs${cs}_nc${nc}.log"
 
     run "${PY_CMD[@]}" train.py \
         --dataset "$dataset" \
@@ -149,8 +156,8 @@ run_one() {
         --repeat_id "$repeat" \
         --classifier_model "$CLASSIFIER_MODEL" \
         --augmentor_model tabmda_encoder \
-        --context_size "$CONTEXT_SIZE" \
-        --num_contexts "$NUM_CONTEXTS" \
+        --context_size "$cs" \
+        --num_contexts "$nc" \
         --num_contexts_val "$NUM_CONTEXTS_VAL" \
         --num_contexts_test "$NUM_CONTEXTS_TEST" \
         --aggregation_over_contexts_test "$AGGREGATION_TEST" \
@@ -158,7 +165,7 @@ run_one() {
 
     local rc=$?
     if [ "$rc" -ne 0 ]; then
-        fail "run failed (exit $rc): dataset=$dataset n=$nrs repeat=$repeat self_context=$arm (see $log_file)"
+        fail "run failed (exit $rc): dataset=$dataset n=$nrs repeat=$repeat self_context=$arm cs=$cs nc=$nc (see $log_file)"
         FAILED=$((FAILED + 1))
         echo
         return 1
@@ -172,7 +179,7 @@ run_one() {
     if [ -n "$test_acc" ]; then
         local out_file="$OUTPUT_DIR/${dataset}.tsv"
         printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-            "$dataset" "$nrs" "$arm" "$CONTEXT_SIZE" "$NUM_CONTEXTS" "$repeat" "$train_acc" "$val_acc" "$test_acc" >> "$out_file"
+            "$dataset" "$nrs" "$arm" "$cs" "$nc" "$repeat" "$train_acc" "$val_acc" "$test_acc" >> "$out_file"
     else
         fail "no metrics parsed from $log_file"
         FAILED=$((FAILED + 1))
@@ -195,7 +202,7 @@ fi
 log "work items: $WORK_ITEMS"
 log "repeats  : $REPEATS"
 log "arms     : $ARMS (self_context)"
-log "context  : context_size=$CONTEXT_SIZE  num_contexts=$NUM_CONTEXTS"
+log "grid     : context_size=[$CONTEXT_SIZES]  x  num_contexts=[$NUM_CONTEXTS_GRID]"
 echo
 
 if [ "$DRY_RUN" != "1" ]; then
@@ -223,8 +230,12 @@ for item in $WORK_ITEMS; do
     nrs="${item#*:}"
     for repeat in $REPEATS; do
         for arm in $ARMS; do
-            TOTAL=$((TOTAL + 1))
-            run_one "$dataset" "$nrs" "$repeat" "$arm"
+            for cs in $CONTEXT_SIZES; do
+                for nc in $NUM_CONTEXTS_GRID; do
+                    TOTAL=$((TOTAL + 1))
+                    run_one "$dataset" "$nrs" "$repeat" "$arm" "$cs" "$nc"
+                done
+            done
         done
     done
 done
@@ -259,7 +270,7 @@ with open(sys.argv[1]) as f:
             train, val, test = float(train), float(val), float(test)
         except ValueError:
             continue
-        rows.setdefault((dataset, int(n), arm), []).append((train, val, test))
+        rows.setdefault((dataset, int(n), arm, cs, nc), []).append((train, val, test))
 
 def meanstd(vals):
     n = len(vals)
@@ -271,18 +282,18 @@ order_arms = ["random", "exclude", "include"]
 arm_rank = {a: i for i, a in enumerate(order_arms)}
 display_names = {"random": "random", "exclude": "exclude (LOO)", "include": "include (leak)"}
 
-display = [(d, n, arm, vals) for (d, n, arm), vals in rows.items()]
-display.sort(key=lambda k: (k[0], k[1], arm_rank.get(k[2], 99)))
+display = [(d, n, arm, cs, nc, vals) for (d, n, arm, cs, nc), vals in rows.items()]
+display.sort(key=lambda k: (k[0], int(k[1]), float(k[3]), int(k[4]), arm_rank.get(k[2], 99)))
 
 print()
-print(f"{'dataset':<22}{'n':>5}  {'arm':<18}{'rep':>4}  {'train':>18}  {'val':>18}  {'test':>18}")
-print("-" * 100)
-for dataset, n, arm, vals in display:
+print(f"{'dataset':<22}{'n':>5}  {'cs':>6}{'nc':>5}  {'arm':<18}{'rep':>4}  {'train':>18}  {'val':>18}  {'test':>18}")
+print("-" * 110)
+for dataset, n, arm, cs, nc, vals in display:
     cnt = len(vals)
     tm, ts = meanstd([v[0] for v in vals])
     vm, vs = meanstd([v[1] for v in vals])
     em, es = meanstd([v[2] for v in vals])
-    print(f"{dataset:<22}{n:>5}  {display_names.get(arm, arm):<18}{cnt:>4}  {tm:>9.4f}+-{ts:<7.4f}  {vm:>9.4f}+-{vs:<7.4f}  {em:>9.4f}+-{es:<7.4f}")
+    print(f"{dataset:<22}{n:>5}  {cs:>6}{nc:>5}  {display_names.get(arm, arm):<18}{cnt:>4}  {tm:>9.4f}+-{ts:<7.4f}  {vm:>9.4f}+-{vs:<7.4f}  {em:>9.4f}+-{es:<7.4f}")
 print()
 print("rep = number of successful repeats aggregated. std is sample std (ddof=1).")
 print("self_context=random (baseline) | exclude = context strictly excludes the sample (LOO) | include = context always contains the sample (leak).")
