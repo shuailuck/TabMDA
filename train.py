@@ -494,16 +494,21 @@ if __name__ == "__main__":
 
         # ==============================================================
         #                       SAVE THE METRICS
-        # ==============================================================      
+        # ==============================================================
+        # `y_test_pred` is aggregated over num_contexts_test back to the ORIGINAL
+        # test-set size, so the test metric must be scored against the original
+        # (non-repeated) test labels, not the num_contexts_test-repeated
+        # `test_data.y` (which only matches when num_contexts_test == 1).
+        y_test_true = to_numpy(y_test)
         metrics = {
             'train/balanced_accuracy': balanced_accuracy_score(train_data.y, y_train_pred),
             'val/balanced_accuracy': balanced_accuracy_score(val_data.y, y_val_pred),
-            'test/balanced_accuracy': balanced_accuracy_score(test_data.y, y_test_pred),
+            'test/balanced_accuracy': balanced_accuracy_score(y_test_true, y_test_pred),
         }
 
         # === Save the test accuracy per class ===
         for class_id in range(args.num_classes):
-            metrics[f'test/balanced_accuracy_class_{class_id}'] = accuracy_score(test_data.y[test_data.y==class_id], y_test_pred[test_data.y==class_id])
+            metrics[f'test/balanced_accuracy_class_{class_id}'] = accuracy_score(y_test_true[y_test_true==class_id], y_test_pred[y_test_true==class_id])
 
         wandb.log(metrics)
         logging.info(f'Metrics: {metrics}')
