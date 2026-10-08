@@ -1,7 +1,6 @@
 # =============== OUR CUSTOM .gitignore ===============
 local_variables.py
 TabPFN/models_diff/*
-TabPFN/tabpfn/models_diff/
 notebooks/data/*
 notebooks/results/*
 notebooks/results_mnist/*
