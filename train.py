@@ -104,6 +104,15 @@ if __name__ == "__main__":
                              '"include": context always contains the sample. '
                              'Only affects the train encoding (val/test use the full training set as context).')
 
+    parser.add_argument('--ensure_full_train_context',
+                        action='store_true',
+                        dest='ensure_full_train_context',
+                        help='Only for tabmda_encoder: guarantee the TRAIN encoding always contains one '
+                             'context built from the FULL training set (it replaces one of the '
+                             '`num_contexts` subset contexts). Used for the test-time-augmentation '
+                             'comparison where augmentation uses subset contexts but a full-train '
+                             'context is retained.')
+
     # ----- Test-time agumetnation -----
     parser.add_argument('--num_contexts_val',   # For validation
                         default=1,
@@ -140,6 +149,8 @@ if __name__ == "__main__":
                         dest='smote_TabMDA',
                         help='True if you want to apply SMOTE augmentation on TabMDA.')
     parser.set_defaults(smote_TabMDA=False)
+
+    parser.set_defaults(ensure_full_train_context=False)
 
     parser.add_argument('--smote_rounds',
                         default=1,
@@ -263,6 +274,13 @@ if __name__ == "__main__":
         args.num_contexts = 1
         logging.warning(f'Context size is 1. Setting num_contexts to 1 (while the user provided args.num_contexts = {args.num_contexts})')
 
+    if args.ensure_full_train_context:
+        assert args.augmentor_model == 'tabmda_encoder',\
+            f"--ensure_full_train_context is only supported for tabmda_encoder, got {args.augmentor_model}"
+        assert args.num_contexts > 1,\
+            f"--ensure_full_train_context requires num_contexts > 1 (got {args.num_contexts}); with a single " \
+            f"context there is nothing to replace and the context already is the full training set."
+
     # ---- Validation ----
     if args.num_contexts_val != 1:
         assert args.classifier_model in NON_DIFFERENTIABLE_CLASSIFIERS,\
@@ -363,6 +381,26 @@ if __name__ == "__main__":
                                         "context_size": 1 if args.num_contexts_test == 1 else args.context_size},
             smote_params=None
         )
+
+        # ==== Optional full-train-context replacement (test-time augmentation arm 2) ====
+        # Replace ONE of the subset contexts with a context built from the FULL training set,
+        # so the augmented train set contains both subset diversity and a full-train encoding.
+        if args.ensure_full_train_context:
+            assert smote_params is None, \
+                "--ensure_full_train_context is not supported together with --smote_TabMDA"
+            X_train_full_enc, _ = TabMDA_model.encode_batch(
+                batch={"x": X_train,           "y": y_train,
+                       "x_context": [X_train], "y_context": [y_train]},
+                context_subsetting_params={"num_contexts": 1, "context_size": 1},
+                smote_params=None
+            )
+            nc = args.num_contexts
+            D = X_train_enc.shape[-1]
+            N = X_train.shape[0]
+            X_train_enc_rs = X_train_enc.reshape(N, nc, D)
+            X_train_enc_rs[:, -1, :] = X_train_full_enc
+            X_train_enc = X_train_enc_rs.reshape(N * nc, D)
+
         print(f"[Data] Original train shape: {X_train.shape}")
         print(f"[Data] Encoded train shape: {X_train_enc.shape}")
 
