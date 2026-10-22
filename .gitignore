@@ -12,6 +12,8 @@ model_checkpoints/*.pt
 **/__pycache__
 results
 results_self_context
+results_contrastive
+adapter_checkpoint.pt
 
 
 
