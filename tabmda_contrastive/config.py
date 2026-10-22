@@ -17,7 +17,7 @@ class ContrastiveConfig:
     adapter_hid_dim: int = 256
     adapter_out_dim: int = 128
     dropout: float = 0.0
-    use_projection: bool = False
+    use_projection: bool = True                       # decouple CE (r) from SupCon (z=g(r)) representations
     proj_dim: int = 128
 
     # Loss

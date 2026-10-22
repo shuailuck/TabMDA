@@ -81,6 +81,7 @@ def add_common_train_args(p):
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--adapter_hid_dim", type=int, default=None)
     p.add_argument("--adapter_out_dim", type=int, default=None)
+    p.add_argument("--use_projection", type=lambda b: b.lower() in ("1", "true", "yes"), default=None)
     p.add_argument("--temperature", type=float, default=None)
     p.add_argument("--alpha", type=float, default=None)
     p.add_argument("--lambda_con", type=float, default=None)
