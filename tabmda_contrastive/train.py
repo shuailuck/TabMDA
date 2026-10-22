@@ -83,6 +83,27 @@ def con_weight_schedule(step: int, total_steps: int, target: float, warmup_ratio
     return target * (step + 1) / wu_steps
 
 
+def _default_logger(log: dict) -> None:
+    """Print one training log line to stdout (used when no logger is supplied)."""
+    if "step" in log:
+        print(
+            f"[epoch {log['epoch']:3d} | step {log['step']:5d}] "
+            f"loss_ce={log['loss_ce']:.4f} loss_con={log['loss_con']:.4f} "
+            f"loss_ctx={log['loss_ctx']:.4f} total={log['total_loss']:.4f} "
+            f"valid_anchors={log['prop_valid_anchors']:.3f}"
+        )
+        return
+    msg = (
+        f"[epoch {log['epoch']:3d}] "
+        f"loss_ce={log['loss_ce']:.4f} loss_con={log['loss_con']:.4f} "
+        f"loss_ctx={log['loss_ctx']:.4f} total={log['total_loss']:.4f}"
+    )
+    val = {k[4:]: v for k, v in log.items() if k.startswith("val_")}
+    if val:
+        msg += " " + " ".join(f"{k}={v:.4f}" for k, v in val.items())
+    print(msg)
+
+
 def train(
     embeddings: torch.Tensor,        # [N, K, D]
     labels: np.ndarray,              # [N]
@@ -94,6 +115,11 @@ def train(
 ) -> dict:
     """Train the adapter + head. Returns a state dict and final training metrics."""
     device = cfg.device
+
+    # Default to stdout when no logger is supplied, otherwise the run stays silent.
+    if logger is None:
+        logger = _default_logger
+
     emb_dim = embeddings.shape[-1]
     n_train = embeddings.shape[0]
     labels = np.asarray(labels, dtype=np.int64)
