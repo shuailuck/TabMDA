@@ -67,22 +67,88 @@ def _stratified_select(n_pool: int, pool_y: np.ndarray, train_size: int, seed: i
         return rng.choice(n_pool, size=train_size, replace=False)
 
 
+def _sample_contexts_random(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    num_contexts: int,
+    context_size: Optional[float],
+    seed: int,
+) -> ContextInfo:
+    """TabMDA ``self_context="random"``: one shared stratified context per index.
+
+    Reproduces :meth:`TabMDA.model.TabMDA.context_subsetting` with
+    ``self_context="random"`` (TabMDA's default): given ``context_size``, sample a
+    label-stratified context from the FULL pool (the query row may appear in its own
+    context) and reuse it for every query. The context size is computed off
+    ``len(X_train)`` (not ``n-1``) and the per-index seed is ``seed + k``, both
+    matching TabMDA exactly.
+    """
+    n = X_train.shape[0]
+    num_classes = len(np.unique(y_train))
+
+    if context_size is None:
+        size = n
+    elif context_size > 1:  # int
+        size = int(context_size)
+    else:  # proportion in (0, 1]
+        size = int(context_size * n)
+    size = max(1, min(size, n))
+
+    all_indices = np.arange(n)
+    seeds_for_contexts = [seed + k for k in range(num_contexts)]
+
+    shared_indices: List[np.ndarray] = []
+    shared_labels: List[np.ndarray] = []
+    for k in range(num_contexts):
+        if size >= n:
+            sel = all_indices
+        else:
+            train_size = min(size, n - num_classes)
+            if train_size <= 0:
+                train_size = size
+            try:
+                sel, _, _, _ = train_test_split(
+                    all_indices, all_indices,
+                    train_size=train_size,
+                    random_state=seeds_for_contexts[k],
+                    stratify=np.asarray(y_train),
+                )
+            except ValueError:
+                rng = np.random.default_rng(seeds_for_contexts[k])
+                sel = rng.choice(n, size=train_size, replace=False)
+        shared_indices.append(sel)
+        shared_labels.append(np.asarray(y_train)[sel])
+
+    # The same context is shared across all queries (TabMDA "random" behaviour),
+    # so the per-query layout is just a repeating copy.
+    indices = [list(shared_indices) for _ in range(n)]
+    labels = [list(shared_labels) for _ in range(n)]
+    return ContextInfo(indices=indices, labels=labels, context_sizes=size)
+
+
 def sample_contexts(
     X_train: np.ndarray,
     y_train: np.ndarray,
     num_contexts: int = 2,
     context_size: Optional[float] = None,
     seed: int = 42,
+    self_context: str = "exclude",
 ) -> ContextInfo:
-    """Sample per-query, per-context labeled contexts excluding the query itself.
+    """Sample per-query labeled contexts for each training sample.
 
     Args:
         X_train: ``[N, F]`` training features.
         y_train: ``[N]`` integer labels.
         num_contexts: number of contexts per original sample (K).
         context_size: None (whole pool), int (absolute size), or float in (0, 1]
-            (proportion of the non-self pool).
+            (proportion of the pool).
         seed: base seed; per-(query, context) seeds are derived deterministically.
+        self_context: how to treat a query row's own ``(x_i, y_i)`` when sampling
+            its context. ``"exclude"`` (default): per-query leave-one-out, the
+            query row is never in its own context. ``"random"``: reproduces
+            TabMDA's default — one shared label-stratified context per context
+            index, sampled from the full pool (so the query row *may* appear in
+            its own context).
 
     Returns:
         :class:`ContextInfo`.
@@ -96,7 +162,12 @@ def sample_contexts(
 
     n = X_train.shape[0]
     if n < 2:
-        raise ValueError("At least two training samples are required to build a non-self context.")
+        raise ValueError("At least two training samples are required to build a context.")
+
+    if self_context == "random":
+        return _sample_contexts_random(X_train, y_train, num_contexts, context_size, seed)
+    if self_context != "exclude":
+        raise ValueError(f"self_context must be 'exclude' or 'random', got {self_context!r}")
 
     all_indices = np.arange(n)
     context_size_int = resolve_context_size(context_size, n - 1)
