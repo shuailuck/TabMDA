@@ -224,7 +224,8 @@ print()
 print("per-cell (num_contexts x context_size) downstream bacc:")
 ncs = sorted({int(k.split('_')[0][2:]) for k in per})
 css = sorted({float(k.split('_')[1][2:]) for k in per})
-print(f"{'cs\\nc':>8}" + "".join(f"{nc:>10}" for nc in ncs))
+hdr = "cs / nc"
+print(f"{hdr:>8}" + "".join(f"{nc:>10}" for nc in ncs))
 for cs in css:
     row = f"{cs:>8}"
     for nc in ncs:
