@@ -1,31 +1,38 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  Label-filter experiment: original TabMDA vs. label-invariant TabMDA
+#  (GRID-SEARCHED, TabMDA-style)
 #
-#  In a fixed "best cell" (context_size=CS, num_contexts=K), we compare the
-#  SAME configuration with and without the label-invariance constraint:
+#  Mirroring run_comparison.sh's protocol for the tabmda_encoder arm, but for
+#  the label-invariance filter comparison. For each (dataset, n, repeat) we try
+#  every combination of
+#      context_size  in CONTEXT_SIZES      (default 0.5 0.7 0.9)
+#      num_contexts  in NUM_CONTEXTS_GRID   (default 5 20 50)
+#  and, once all repeats are collected, select the setting with the best mean
+#  VALIDATION balanced accuracy. Only that setting's TEST score is reported.
 #
-#    * original TabMDA  - train.py --augmentor_model tabmda_encoder (no filter),
-#                         the contexts are used exactly as TabMDA builds them.
-#    * unfiltered       - the controlled per-query baseline inside
-#                         experiment_label_filter.py: same candidate generator
-#                         as the filtered arm, no constraint applied.
-#    * filtered         - keep only the first K candidate contexts where
-#                         argmax P(y | TabPFN(x_i, C)) == y_i  (label-invariant).
-#    * filtered_matched - like filtered, but restricted to queries that admit
-#                         >= K valid contexts (matches per-query K).
+#  Three arms, each grid-searched independently (so the comparison is fair —
+#  every arm gets its own best (cs, nc)):
 #
-#  All downstream arms use the SAME frozen-TabPFN embedding + LogisticRegression
-#  + full-train-context test encoding + balanced accuracy. The internal
-#  unfiltered arm shares the filtered arm's candidate generator, so ANY gap
-#  between them is attributable to the filter itself; the train.py arm is the
-#  external "original TabMDA" anchor.
+#    * tabmda     - original TabMDA (train.py --augmentor_model tabmda_encoder).
+#    * unfiltered - the controlled per-query baseline inside
+#                   experiment_label_filter.py (same leak-free per-query
+#                   context generator as the filtered arm, NO filter applied).
+#    * filtered   - same generator, but keep sampling contexts until exactly K
+#                   satisfy argmax P(y | TabPFN(x_i, C)) == y_i
+#                   (label-invariant). Queries that can't reach K valid contexts
+#                   within `max_attempts` are dropped (reported).
+#
+#  All arms use the SAME frozen-TabPFN embedding + LogisticRegression
+#  downstream; the val/test protocols are likewise matched. The difference
+#  between filtered and unfiltered is attributable to the filter alone; the
+#  train.py `tabmda` arm is the external "original TabMDA" anchor.
 #
 #  Usage:
-#      bash run_label_filter.sh                        # vehicle@100, cs=0.5, K=5
+#      bash run_label_filter.sh                        # vehicle@100, grid 0.5/0.7/0.9 x 5/20/50
 #      DRY_RUN=1 bash run_label_filter.sh              # print commands only
 #      DATASETS="vehicle texture" REPEATS="0 1 2" bash run_label_filter.sh
-#      CONTEXT_SIZE=0.5 NUM_CONTEXTS=5 OVERSAMPLE=5 bash run_label_filter.sh
+#      CONTEXT_SIZES="0.5 0.9" NUM_CONTEXTS_GRID="5 20" bash run_label_filter.sh
 #
 #  Overridable via environment variables (see below).
 # ============================================================================
@@ -39,24 +46,33 @@ CONDA_ENV="${CONDA_ENV:-tabmda}"          # conda env holding the TabPFN v1 inst
 PYTHON_BIN="${PYTHON_BIN:-}"              # override with a full path if needed
 
 # ---------------------------------------------------------------------------
-#  Shared config
+#  Datasets and num_real_samples
 # ---------------------------------------------------------------------------
 DATASETS="${DATASETS:-vehicle}"
 NUM_REAL_SAMPLES="${NUM_REAL_SAMPLES:-100}"
 REPEATS="${REPEATS:-0}"
 
-# The "best fixed cell" (same cs, nc for the with/without comparison).
-CONTEXT_SIZE="${CONTEXT_SIZE:-0.5}"       # proportion of the train set per context
-NUM_CONTEXTS="${NUM_CONTEXTS:-5}"         # K contexts per sample
+# ---------------------------------------------------------------------------
+#  Grid (context_size x num_contexts), selected by mean val over repeats
+# ---------------------------------------------------------------------------
+CONTEXT_SIZES="${CONTEXT_SIZES:-0.5 0.7 0.9}"
+NUM_CONTEXTS_GRID="${NUM_CONTEXTS_GRID:-5 20 50}"
 
-# Label-filter specifics (experiment_label_filter.py)
+# ---------------------------------------------------------------------------
+#  Label-filter specifics (experiment_label_filter.py fixed-cell mode)
+# ---------------------------------------------------------------------------
 MAX_ATTEMPTS="${MAX_ATTEMPTS:-100}"        # hard cap on sampling attempts/query while filtering
-SELF_CONTEXT="${SELF_CONTEXT:-exclude}"   # per-query leak-free contexts (required for the filter)
+SELF_CONTEXT="${SELF_CONTEXT:-exclude}"    # leak-free per-query contexts (required for the filter)
 SEED="${SEED:-42}"
 
-# TabMDA reference (train.py)
+# ---------------------------------------------------------------------------
+#  TabMDA reference (train.py)
+# ---------------------------------------------------------------------------
 CLASSIFIER_MODEL="${CLASSIFIER_MODEL:-LogReg}"
 TRAIN_EPOCHS="${TRAIN_EPOCHS:-30}"
+NUM_CONTEXTS_VAL="${NUM_CONTEXTS_VAL:-1}"
+NUM_CONTEXTS_TEST="${NUM_CONTEXTS_TEST:-1}"
+AGGREGATION_TEST="${AGGREGATION_TEST:-mean}"
 
 # ---------------------------------------------------------------------------
 #  Output
@@ -100,6 +116,9 @@ extract_metric() {
     grep -oE "$2': [0-9.eE+-]+" "$1" 2>/dev/null | head -1 | grep -oE "[0-9.eE+-]+$"
 }
 
+# s2p: turn a float context_size into the 'p'-suffixed token used in filenames.
+s2p() { printf '%s' "$1" | tr '.' 'p'; }
+
 # ---------------------------------------------------------------------------
 #  Build work list
 # ---------------------------------------------------------------------------
@@ -114,11 +133,11 @@ done
 #  Resolve python + plan
 # ---------------------------------------------------------------------------
 resolve_python
-log "python    : ${PY_CMD[*]}"
-log "datasets  : $DATASETS   n=$NUM_REAL_SAMPLES   repeats=$REPEATS"
-log "cell      : context_size=$CONTEXT_SIZE  num_contexts=$NUM_CONTEXTS"
-log "filter    : max_attempts=$MAX_ATTEMPTS  self_context=$SELF_CONTEXT  seed=$SEED"
-log "tabmda    : classifier=$CLASSIFIER_MODEL  epochs=$TRAIN_EPOCHS  wandb=$ENABLE_WANDB"
+log "python      : ${PY_CMD[*]}"
+log "datasets    : $DATASETS   n=$NUM_REAL_SAMPLES   repeats=$REPEATS"
+log "grid        : context_size=[$CONTEXT_SIZES]  x  num_contexts=[$NUM_CONTEXTS_GRID]"
+log "filter      : max_attempts=$MAX_ATTEMPTS  self_context=$SELF_CONTEXT  seed=$SEED"
+log "tabmda      : classifier=$CLASSIFIER_MODEL  epochs=$TRAIN_EPOCHS  wandb=$ENABLE_WANDB"
 if [ "$DRY_RUN" = "1" ]; then
     log "dry-run: commands below are NOT executed."
 fi
@@ -126,9 +145,11 @@ echo
 
 mkdir -p "$LOGS_DIR" "$OUTPUT_DIR"
 
-# Fresh per-dataset TSV.
+# Fresh per-dataset TSV holding the tabmda arm rows (unfiltered/filtered are
+# parsed from the per-cell JSONs in the aggregation step).
+# Columns: dataset  n  repeat  cs  nc  arm  val  test
 for d in $DATASETS; do
-    printf 'dataset\tn\trepeat\tcs\tnc\tarm\ttest\n' > "$OUTPUT_DIR/${d}.tsv"
+    printf 'dataset\tn\trepeat\tcs\tnc\tarm\tval\ttest\n' > "$OUTPUT_DIR/${d}.tsv"
 done
 
 FAILED=0
@@ -137,128 +158,171 @@ for item in $WORK_ITEMS; do
     dataset="${item%%:*}"
     n="${item#*:}"
     for repeat in $REPEATS; do
-        cs="$CONTEXT_SIZE"
-        K="$NUM_CONTEXTS"
+        for cs in $CONTEXT_SIZES; do
+            for nc in $NUM_CONTEXTS_GRID; do
 
-        # ===== Arm A: original TabMDA (train.py, no filter) =====
-        tabmda_log="$LOGS_DIR/tabmda_${dataset}_n${n}_r${repeat}_cs${cs}_nc${K}.log"
-        if [ "$DRY_RUN" = "1" ]; then
-            echo "   ${PY_CMD[*]} train.py --dataset $dataset --num_real_samples $n --repeat_id $repeat \
+                # ===== Arm A: original TabMDA (train.py, grid cell) =====
+                tabmda_log="$LOGS_DIR/tabmda_${dataset}_n${n}_r${repeat}_cs${cs}_nc${nc}.log"
+                if [ "$DRY_RUN" = "1" ]; then
+                    echo "   ${PY_CMD[*]} train.py --dataset $dataset --num_real_samples $n --repeat_id $repeat \
 --augmentor_model tabmda_encoder --classifier_model $CLASSIFIER_MODEL \
---context_size $cs --num_contexts $K --train_epochs $TRAIN_EPOCHS > $tabmda_log"
-        else
-            log "== [$dataset n=$n r=$repeat] original TabMDA =="
-            if run "${PY_CMD[@]}" train.py \
-                --dataset "$dataset" --num_real_samples "$n" --repeat_id "$repeat" \
-                --augmentor_model tabmda_encoder --classifier_model "$CLASSIFIER_MODEL" \
-                --context_size "$cs" --num_contexts "$K" --train_epochs "$TRAIN_EPOCHS" \
-                > "$tabmda_log" 2>&1; then
-                ta=$(extract_metric "$tabmda_log" "test/balanced_accuracy")
-                printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$dataset" "$n" "$repeat" "$cs" "$K" "tabmda" "${ta:-nan}" >> "$OUTPUT_DIR/${dataset}.tsv"
-            else
-                fail "train.py failed: $dataset n=$n r=$repeat (see $tabmda_log)"
-                FAILED=$((FAILED + 1))
-            fi
-        fi
+--context_size $cs --num_contexts $nc --train_epochs $TRAIN_EPOCHS > $tabmda_log"
+                else
+                    log "== [$dataset n=$n r=$repeat cs=$cs nc=$nc] original TabMDA =="
+                    if run "${PY_CMD[@]}" train.py \
+                        --dataset "$dataset" --num_real_samples "$n" --repeat_id "$repeat" \
+                        --augmentor_model tabmda_encoder --classifier_model "$CLASSIFIER_MODEL" \
+                        --context_size "$cs" --num_contexts "$nc" \
+                        --num_contexts_val "$NUM_CONTEXTS_VAL" --num_contexts_test "$NUM_CONTEXTS_TEST" \
+                        --aggregation_over_contexts_test "$AGGREGATION_TEST" \
+                        --train_epochs "$TRAIN_EPOCHS" \
+                        > "$tabmda_log" 2>&1; then
+                        tv=$(extract_metric "$tabmda_log" "val/balanced_accuracy")
+                        te=$(extract_metric "$tabmda_log" "test/balanced_accuracy")
+                        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+                            "$dataset" "$n" "$repeat" "$cs" "$nc" "tabmda" "${tv:-nan}" "${te:-nan}" \
+                            >> "$OUTPUT_DIR/${dataset}.tsv"
+                    else
+                        fail "train.py failed: $dataset n=$n r=$repeat cs=$cs nc=$nc (see $tabmda_log)"
+                        FAILED=$((FAILED + 1))
+                    fi
+                fi
 
-        # ===== Arm B: label-filter (unfiltered / filtered / filtered_matched) =====
-        lv_cmd=("${PY_CMD[@]}" experiment_label_filter.py \
-            --dataset "$dataset" --num_real_samples "$n" --repeat_id "$repeat" \
-            --context_size "$cs" --num_contexts "$K" --max_attempts "$MAX_ATTEMPTS" \
-            --self_context "$SELF_CONTEXT" --seed "$SEED" --out_dir "$OUTPUT_DIR")
-        if [ "$DRY_RUN" = "1" ]; then
-            echo "   ${lv_cmd[*]}"
-        else
-            log "== [$dataset n=$n r=$repeat] label filter =="
-            if run "${lv_cmd[@]}"; then
-                lv_json="$OUTPUT_DIR/label_filter_${dataset}_r${repeat}_cs${cs}_nc${K}.json"
-                # (numeric extraction deferred to the aggregation python below)
-            else
-                fail "experiment_label_filter.py failed: $dataset n=$n r=$repeat"
-                FAILED=$((FAILED + 1))
-            fi
-        fi
-        echo
+                # ===== Arm B: label-filter (unfiltered / filtered at this cell) =====
+                lv_cmd=("${PY_CMD[@]}" experiment_label_filter.py \
+                    --dataset "$dataset" --num_real_samples "$n" --repeat_id "$repeat" \
+                    --context_size "$cs" --num_contexts "$nc" --max_attempts "$MAX_ATTEMPTS" \
+                    --self_context "$SELF_CONTEXT" --seed "$SEED" --out_dir "$OUTPUT_DIR")
+                if [ "$DRY_RUN" = "1" ]; then
+                    echo "   ${lv_cmd[*]}"
+                else
+                    log "== [$dataset n=$n r=$repeat cs=$cs nc=$nc] label filter =="
+                    if ! run "${lv_cmd[@]}"; then
+                        fail "experiment_label_filter.py failed: $dataset n=$n r=$repeat cs=$cs nc=$nc"
+                        FAILED=$((FAILED + 1))
+                    fi
+                fi
+                echo
+            done
+        done
     done
 done
 
 [ "$DRY_RUN" = "1" ] && exit 0
 
 # ---------------------------------------------------------------------------
-#  Merge per-repeat label-filter JSONs into the TSV, then aggregate.
+#  Aggregate over repeats -> mean +/- std, per arm; select best cell by val.
+#
+#  Reads the tabmda rows from $OUTPUT_DIR/<dataset>.tsv and the unfiltered/
+#  filtered arms from the per-cell JSONs, then:
+#    (1) groups by (n, arm, cs, nc) over repeats,
+#    (2) selects the (cs, nc) with the best mean VAL balanced accuracy,
+#    (3) reports that cell's TEST balanced accuracy as mean +/- std.
 # ---------------------------------------------------------------------------
 for item in $WORK_ITEMS; do
     dataset="${item%%:*}"
     n="${item#*:}"
-    for repeat in $REPEATS; do
-        cs="$CONTEXT_SIZE"; K="$NUM_CONTEXTS"
-        cs_file=$(printf '%s' "$cs" | tr '.' 'p')
-        lv_json="$OUTPUT_DIR/label_filter_${dataset}_r${repeat}_cs${cs_file}_nc${K}.json"
-        [ -s "$lv_json" ] || continue
-        python - "$lv_json" "$dataset" "$n" "$repeat" "$cs" "$K" "$OUTPUT_DIR/${dataset}.tsv" <<'PY'
-import json, sys
-j, d, n, r, cs, K, tsv = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5], sys.argv[6], sys.argv[7]
-data = json.load(open(j))
-arms = data["arms"]
-with open(tsv, "a") as f:
-    for arm in ("unfiltered", "filtered"):
-        v = arms[arm].get("balanced_accuracy", float("nan"))
-        f.write(f"{d}\t{n}\t{r}\t{cs}\t{K}\t{arm}\t{v}\n")
-PY
-    done
-done
-
-# ---------------------------------------------------------------------------
-#  Aggregate over repeats -> mean +/- std, per arm; print side-by-side.
-# ---------------------------------------------------------------------------
-for d in $DATASETS; do
-    tsv="$OUTPUT_DIR/${d}.tsv"
+    tsv="$OUTPUT_DIR/${dataset}.tsv"
     [ -s "$tsv" ] || continue
-    log "aggregating $d ..."
-    python - "$tsv" <<'PY'
-import sys, math, collections
+    log "aggregating $dataset ..."
+    python - "$tsv" "$OUTPUT_DIR" "$dataset" "$n" "$REPEATS" "$CONTEXT_SIZES" "$NUM_CONTEXTS_GRID" <<'PY'
+import sys, math, json, os
 
-rows = collections.OrderedDict()  # (n, arm) -> list of test values
-with open(sys.argv[1]) as f:
-    header = f.readline().rstrip("\n").split("\t")
+tsv_path, out_dir, dataset, n_str = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+repeats = sys.argv[5].split()
+cs_list = sys.argv[6].split()
+nc_list = sys.argv[7].split()
+n = int(n_str)
+
+def s2p(x):
+    return x.replace('.', 'p')
+
+# rows[(arm, cs, nc)] = list of (val, test)
+rows = {}
+
+# --- tabmda rows (from TSV) ---
+with open(tsv_path) as f:
+    header = f.readline().rstrip('\n').split('\t')
     for line in f:
-        p = line.rstrip("\n").split("\t")
-        if len(p) < 7:
+        p = line.rstrip('\n').split('\t')
+        if len(p) < 8:
             continue
-        dataset, n, repeat, cs, nc, arm, test = p[0], p[1], p[2], p[3], p[4], p[5], p[6]
+        d, rn, rep, cs, nc, arm, val, test = p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]
+        if d != dataset or int(rn) != n or arm != 'tabmda':
+            continue
         try:
-            test = float(test)
+            val, test = float(val), float(test)
         except ValueError:
             continue
-        rows.setdefault((int(n), arm), []).append(test)
+        rows.setdefault((arm, cs, nc), []).append((val, test))
 
-def meanstd(v):
-    m = sum(v) / len(v)
-    s = math.sqrt(sum((x - m) ** 2 for x in v) / (len(v) - 1)) if len(v) > 1 else 0.0
+# --- unfiltered / filtered arms (from per-cell JSONs) ---
+for rep in repeats:
+    for cs in cs_list:
+        for nc in nc_list:
+            jp = os.path.join(out_dir, f"label_filter_{dataset}_r{rep}_cs{s2p(cs)}_nc{nc}.json")
+            if not os.path.isfile(jp):
+                continue
+            d = json.load(open(jp))
+            for arm in ("unfiltered", "filtered"):
+                a = d["arms"][arm]
+                val = a.get("val_balanced_accuracy", float("nan"))
+                test = a.get("balanced_accuracy", float("nan"))
+                if val is None or (isinstance(val, float) and math.isnan(val)):
+                    continue
+                rows.setdefault((arm, cs, nc), []).append((float(val), float(test)))
+
+def meanstd(vals):
+    m = sum(vals) / len(vals)
+    s = math.sqrt(sum((x - m) ** 2 for x in vals) / (len(vals) - 1)) if len(vals) > 1 else 0.0
     return m, s
 
-order = ["tabmda", "unfiltered", "filtered"]
-print()
-print("=" * 86)
-print("Label-invariant filter vs. original TabMDA  (same cell cs, nc, LogReg downstream)")
-print("=" * 86)
-print(f"{'n':>5}  {'arm':<18}{'rep':>4}  {'test bacc':>18}")
-print("-" * 86)
-for (n, arm), vals in rows.items():
-    m, s = meanstd(vals)
-    print(f"{n:>5}  {arm:<18}{len(vals):>4}  {m:>9.4f} +- {s:<7.4f}")
-print("-" * 86)
+# --- select best (cs, nc) per arm by mean val ---
+best = {}  # arm -> (val_mean, cs, nc, list_of_(val,test))
+for (arm, cs, nc), vals in rows.items():
+    vm = sum(v[0] for v in vals) / len(vals)
+    if arm not in best or vm > best[arm][0]:
+        best[arm] = (vm, cs, nc, vals)
 
-# per-n delta: filtered vs unfiltered (controlled), filtered vs tabmda (external)
+order = ["tabmda", "unfiltered", "filtered"]
+
 print()
-print("Deltas (mean over repeats):")
-for (n, arm), vals in rows.items():
-    if arm == "unfiltered":
-        # build delta table from per-repeat aligned values isn't trivial post-aggregation;
-        # report point differences of means for readability:
+print("=" * 96)
+print("Label-invariant filter vs. original TabMDA  (grid-searched, best cell by val)")
+print("=" * 96)
+print(f"  dataset={dataset}  n={n}  repeats={len(repeats)}")
+print(f"  grid: context_size=[{' '.join(cs_list)}]  x  num_contexts=[{' '.join(nc_list)}]")
+print("-" * 96)
+print(f"{'arm':<14}{'best cs':>10}{'best nc':>10}{'rep':>5}  {'val bacc':>18}  {'test bacc':>18}")
+print("-" * 96)
+for arm in order:
+    if arm not in best:
+        print(f"{arm:<14}{'-':>10}{'-':>10}{0:>5}  {'nan':>18}  {'nan':>18}")
         continue
-print("  (see aggregated means above; pair deltas computed per-repeat below if repeats > 1)")
+    vm, cs, nc, vals = best[arm]
+    cnt = len(vals)
+    vmu, vsd = meanstd([v[0] for v in vals])
+    tmu, tsd = meanstd([v[1] for v in vals])
+    print(f"{arm:<14}{cs:>10}{nc:>10}{cnt:>5}  {vmu:>9.4f}+-{vsd:<7.4f}  {tmu:>9.4f}+-{tsd:<7.4f}")
+print("-" * 96)
+
+# --- deltas ---
+if "unfiltered" in best and "filtered" in best:
+    df = best["filtered"][3]
+    du = best["unfiltered"][3]
+    _, fcs, fnc, fv = best["filtered"]
+    _, ucs, unc, uv = best["unfiltered"]
+    print()
+    print("Selected settings:")
+    print(f"  tabmda      cs={best['tabmda'][1]} nc={best['tabmda'][2]}" if "tabmda" in best else "  tabmda      (no data)")
+    print(f"  unfiltered  cs={ucs} nc={unc}")
+    print(f"  filtered    cs={fcs} nc={fnc}")
+print()
+print("rep = number of successful repeats aggregated. std is sample std (ddof=1).")
+print("Each arm is grid-searched independently; the best (context_size, num_contexts)")
+print("is chosen by mean VAL balanced accuracy over repeats.")
 PY
+    echo
 done
 
 if [ "$FAILED" -ne 0 ]; then

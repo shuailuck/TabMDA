@@ -13,7 +13,10 @@ model_checkpoints/*.pt
 results
 results_self_context
 results_contrastive
+results_label_filter
+results_label_invariant
 adapter_checkpoint.pt
+*.docx
 
 
 
