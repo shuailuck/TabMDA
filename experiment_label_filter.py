@@ -8,30 +8,16 @@ recovers the true label ``y_i`` from them. If the embedding is only
 *approximately* label-invariant, then "bad" contexts (those where TabPFN itself
 fails to predict ``y_i``) inject noise.
 
-This experiment takes ONE fixed cell ``(context_size=cs, num_contexts=K)``
-(the "best fixed cell") and compares, under an identical frozen-TabPFN +
-LogisticRegression downstream protocol, two arms that BOTH have exactly ``K``
-contexts per training sample:
+This experiment, for ONE cell ``(context_size=cs, num_contexts=K)``, builds
+per-query leak-free, label-stratified contexts and keeps *sampling*
+(deterministic) until exactly ``K`` of them satisfy the label-invariance
+constraint ``argmax P(y | x_i, C) == y_i``. A query that still fails to reach
+``K`` valid contexts within ``max_attempts`` is dropped (reported), so every
+retained query contributes exactly ``K`` contexts.
 
-  * **unfiltered**  - the first ``K`` contexts TabMDA would use (no constraint).
-  * **filtered**    - keep *sampling* contexts (leak-free, label-stratified,
-                      deterministic) until exactly ``K`` contexts satisfy the
-                      label-invariance constraint ``argmax P(y | x_i, C) == y_i``,
-                      then use those ``K``.
-
-Because the filtered arm keeps sampling until it has ``K`` valid contexts, it is
-guaranteed ``num_contexts == K`` for every query it retains — the same per-query
-count as the unfiltered arm (and as TabMDA). A query that still fails to reach
-``K`` valid contexts within ``max_attempts`` is dropped (reported), so the two
-arms never differ in context count, only in *which* contexts are kept.
-
-Note on TabMDA consistency
---------------------------
-The real TabMDA pipeline shares ONE stratified context per context *index*
-(reused across queries) and may place a query in its own context. That structure
-cannot be combined with a per-query correctness filter (the filter depends on
-``x_i``). This script therefore builds per-query contexts for BOTH arms so the
-comparison is controlled; the real shared-context TabMDA is run separately by
+The downstream protocol is a frozen TabPFN embedding + LogisticRegression with
+full-train-context val/test encoding, matching the ``tabmda_encoder`` arm of
+``train.py``. The original shared-context TabMDA is run separately by
 ``run_label_filter.sh`` via ``train.py`` as the external anchor.
 
 Examples
@@ -41,6 +27,9 @@ Examples
 
     # quick smoke test
     python experiment_label_filter.py --smoke
+
+    # suppress the JSON summary; print a parseable RESULT_FILTERED line instead
+    python experiment_label_filter.py --dataset vehicle --no_json
 """
 
 from __future__ import annotations
@@ -60,12 +49,6 @@ from sklearn.metrics import balanced_accuracy_score
 
 
 TABPFN_HIDDEN_DIM = 512
-
-
-def _parse_grid(spec, default, cast):
-    if spec is None:
-        return [default]
-    return [cast(x) for x in spec.split(",") if x.strip() != ""]
 
 
 # ---------------------------------------------------------------- data utils
@@ -173,23 +156,17 @@ def fit_and_eval(X_train_sel, y_train_sel, X_val_emb, y_val, X_test_emb, y_test)
     return val_bacc, test_bacc
 
 
-def compute_query(enc, model, i, X_tr, y_tr, y_i, K, dim, context_size, seed, max_attempts,
-                  start_attempt=0, include_unfiltered=True):
-    """Build per-query contexts for query ``i``.
+def compute_query(enc, model, i, X_tr, y_tr, y_i, K, dim, context_size, seed, max_attempts):
+    """Build the ``K`` filtered contexts for query ``i``.
 
-    Args:
-        start_attempt: where to begin sampling (so a cell can reuse contexts the
-            unfiltered baseline already consumed).
-        include_unfiltered: whether to also return the first ``K`` contexts with
-            no constraint (default True); the optional arm the grid only needs for
-            the anchor cell.
+    Keeps sampling leak-free, label-stratified contexts (deterministically)
+    until exactly ``K`` satisfy ``argmax P(y | x_i, C) == y_i``, up to
+    ``max_attempts`` total samples.
 
     Returns:
-        unf_emb  [K, dim]  first K contexts (no constraint); zeros if not requested
-        filt_emb [K, dim]  first K contexts satisfying TabPFN(x_i|C)==y_i
-                           (zero-filled if not enough found)
+        filt_emb [K, dim]  first K valid contexts (zero-filled if not enough found)
         ok       bool      True iff ``K`` valid contexts were found
-        n_attempts int     how many contexts were sampled for the filter
+        n_attempts int     how many contexts were sampled
     """
     gen = make_context_generator(X_tr.numpy(), y_tr.numpy(), i, context_size, seed)
     x_q = X_tr[i:i + 1]
@@ -197,12 +174,9 @@ def compute_query(enc, model, i, X_tr, y_tr, y_i, K, dim, context_size, seed, ma
     X_np = X_tr.numpy().astype(np.float32)
     y_np = y_tr.numpy().astype(np.int64)
 
-    unf_sel = list(range(K)) if include_unfiltered else []
-
-    # filtered selection: keep sampling until K valid, up to max_attempts
     filt_sel = []
-    attempts = start_attempt
-    while len(filt_sel) < K and attempts < start_attempt + max_attempts:
+    attempts = 0
+    while len(filt_sel) < K and attempts < max_attempts:
         idx = gen(attempts)
         pred = predict_label(enc, X_np[idx], y_np[idx], x_q_np)
         if pred == y_i:
@@ -210,34 +184,21 @@ def compute_query(enc, model, i, X_tr, y_tr, y_i, K, dim, context_size, seed, ma
         attempts += 1
     ok = (len(filt_sel) == K)
 
-    # encode only the union of the two selections
-    need = sorted(set(unf_sel) | set(filt_sel))
-    emb_map = {}
-    for k in need:
-        idx = gen(k)
-        emb_map[k] = encode_query(enc, model, x_q, X_tr[idx], y_tr[idx])
-
-    unf_emb = np.zeros((K, dim), dtype=np.float32)
-    if unf_sel:
-        unf_emb = np.stack([emb_map[k] for k in unf_sel]).astype(np.float32)
     filt_emb = np.zeros((K, dim), dtype=np.float32)
     if ok:
-        filt_emb = np.stack([emb_map[k] for k in filt_sel]).astype(np.float32)
+        filt_emb = np.stack([encode_query(enc, model, x_q, X_tr[gen(k)], y_tr[gen(k)])
+                             for k in filt_sel]).astype(np.float32)
 
-    return unf_emb, filt_emb, ok, attempts
+    return filt_emb, ok, attempts
 
 
 def compute_cell_embeddings(enc, model, sample_ids, y_train, X_tr, y_tr, K, dim,
-                            context_size, seed, max_attempts, cell_cache_dir,
-                            with_unfiltered=False):
-    """Compute per-query embeddings for one (context_size, K) cell.
+                            context_size, seed, max_attempts, cell_cache_dir):
+    """Compute per-query filtered embeddings for one (context_size, K) cell.
 
     Loops over ``sample_ids``, caching each query's embeddings to
-    ``cell_cache_dir/q_{i}.npz``. Returns either the filtered rows only, or
-    ``(unf_rows, unf_yrows, filt_rows, filt_yrows, stats)`` when
-    ``with_unfiltered`` is set.
+    ``cell_cache_dir/q_{i}.npz``. Returns ``(filt_rows, filt_yrows, stats)``.
     """
-    unf_rows, unf_yrows = [], []
     filt_rows, filt_yrows = [], []
     n_dropped = 0
     attempts_sum = 0
@@ -248,19 +209,15 @@ def compute_cell_embeddings(enc, model, sample_ids, y_train, X_tr, y_tr, K, dim,
         qp = os.path.join(cell_cache_dir, f"q_{i}.npz")
         if os.path.exists(qp):
             z = np.load(qp)
-            unf_emb, filt_emb = z["unf_emb"], z["filt_emb"]
+            filt_emb = z["filt_emb"]
             ok, n_attempts = bool(z["ok"]), int(z["n_attempts"])
         else:
-            unf_emb, filt_emb, ok, n_attempts = compute_query(
+            filt_emb, ok, n_attempts = compute_query(
                 enc, model, i, X_tr, y_tr, y_i, K, dim,
-                context_size, seed, max_attempts, include_unfiltered=with_unfiltered,
+                context_size, seed, max_attempts,
             )
-            np.savez(qp, unf_emb=unf_emb, filt_emb=filt_emb, ok=ok, n_attempts=n_attempts)
+            np.savez(qp, filt_emb=filt_emb, ok=ok, n_attempts=n_attempts)
 
-        if with_unfiltered:
-            for k in range(K):
-                unf_rows.append(unf_emb[k])
-                unf_yrows.append(y_i)
         if ok:
             for k in range(K):
                 filt_rows.append(filt_emb[k])
@@ -279,13 +236,9 @@ def compute_cell_embeddings(enc, model, sample_ids, y_train, X_tr, y_tr, K, dim,
         "mean_attempts_per_query": float(mean_attempts),
         "acceptance_rate": float(accept),
     }
-    unf_rows = np.asarray(unf_rows, dtype=np.float32)
-    unf_yrows = np.asarray(unf_yrows, dtype=np.int64)
     filt_rows = np.asarray(filt_rows, dtype=np.float32)
     filt_yrows = np.asarray(filt_yrows, dtype=np.int64)
 
-    if with_unfiltered:
-        return unf_rows, unf_yrows, filt_rows, filt_yrows, stats
     return filt_rows, filt_yrows, stats
 
 
@@ -313,12 +266,8 @@ def main():
     p.add_argument("--dataset", default="vehicle")
     p.add_argument("--num_real_samples", type=int, default=100)
     p.add_argument("--repeat_id", type=int, default=0)
-    p.add_argument("--context_size", type=float, default=0.5, help="fixed cell cs (proportion)")
+    p.add_argument("--context_size", type=float, default=0.5, help="cell cs (proportion)")
     p.add_argument("--num_contexts", type=int, default=5, help="target K contexts per query")
-    p.add_argument("--grid_num_contexts", type=str, default=None,
-                   help="'nc1,nc2,...' to search over K; overrides --num_contexts when set")
-    p.add_argument("--grid_context_size", type=str, default=None,
-                   help="'cs1,cs2,...' to search over context_size; overrides --context_size when set")
     p.add_argument("--max_attempts", type=int, default=100,
                    help="hard cap on contexts sampled per query while filtering")
     p.add_argument("--self_context", type=str, default="exclude",
@@ -328,6 +277,8 @@ def main():
     p.add_argument("--max_samples", type=int, default=None, help="cap #train samples to encode (debug)")
     p.add_argument("--max_test", type=int, default=None, help="cap #test rows to encode (debug)")
     p.add_argument("--smoke", action="store_true", help="tiny deterministic smoke config")
+    p.add_argument("--no_json", action="store_true",
+                   help="skip writing the JSON summary; print a parseable RESULT_FILTERED line")
     p.add_argument("--cache_dir", default="results_label_filter/cache")
     p.add_argument("--out_dir", default="results_label_filter")
     args = p.parse_args()
@@ -349,12 +300,6 @@ def main():
     base_cache_dir = os.path.join(repo_root, args.cache_dir)
     os.makedirs(out_dir, exist_ok=True)
     os.makedirs(base_cache_dir, exist_ok=True)
-
-    tag = (f"sc_{args.self_context}_seed{args.seed}_d{args.dataset}_n{args.num_real_samples}"
-           f"_r{args.repeat_id}_cs{str(args.context_size).replace('.', 'p')}"
-           f"_nc{K}_maxa{args.max_attempts}")
-    cache_dir = os.path.join(base_cache_dir, tag)
-    os.makedirs(cache_dir, exist_ok=True)
 
     # ---------- data ----------
     try:
@@ -378,17 +323,11 @@ def main():
     N = X_train.shape[0]
 
     # ---------- grid ----------
-    grid_cs = _parse_grid(args.grid_context_size, args.context_size, float)
-    grid_nc = _parse_grid(args.grid_num_contexts, args.num_contexts, int)
-    is_grid = args.grid_context_size is not None or args.grid_num_contexts is not None
-    # the anchor cell (unfiltered baseline) uses the first grid entry (or the fixed value)
-    anchor_cs, anchor_nc = grid_cs[0], grid_nc[0]
+    K = args.num_contexts
+    cs = args.context_size
 
     print(f"[setup] dataset={args.dataset} train={N} val={X_val.shape[0]} test={X_test.shape[0]} classes={num_classes}")
-    print(f"[setup] grid cs={grid_cs} nc={grid_nc}  filter until K valid/query max_attempts={args.max_attempts}")
-    if is_grid:
-        print(f"[setup] grid-search mode: select best (cs, nc) by VAL balanced accuracy; "
-              f"unfiltered baseline computed at cs={anchor_cs}, nc={anchor_nc}")
+    print(f"[setup] cell cs={cs} nc={K}  filter until K valid/query max_attempts={args.max_attempts}")
 
     # ---------- backbone ----------
     tabpfn_base = os.path.join(repo_root, "TabPFN", "tabpfn")
@@ -438,51 +377,17 @@ def main():
 
     y_sel = y_train[sample_ids]
 
-    # ---------- phase 1: unfiltered baseline (anchor cell only) ----------
-    unf_bacc_val = unf_bacc_test = float("nan")
-    unf_rows = unf_yrows = None
-    anchor_cache_dir = make_cell_cache_dir(shared_cache_dir, anchor_cs, anchor_nc)
-    print(f"[phase1] unfiltered baseline cell cs={anchor_cs} nc={anchor_nc} ...")
-    unf_rows, unf_yrows, _, _, _ = compute_cell_embeddings(
-        enc, model, sample_ids, y_sel, X_tr, y_tr, anchor_nc, TABPFN_HIDDEN_DIM,
-        anchor_cs, args.seed, args.max_attempts, anchor_cache_dir, with_unfiltered=True,
+    # ---------- filtered cell ----------
+    cell_cache_dir = make_cell_cache_dir(shared_cache_dir, cs, K)
+    print(f"[filter] cell cs={cs} nc={K} ...")
+    filt_rows, filt_yrows, stats = compute_cell_embeddings(
+        enc, model, sample_ids, y_sel, X_tr, y_tr, K, TABPFN_HIDDEN_DIM,
+        cs, args.seed, args.max_attempts, cell_cache_dir,
     )
-    unf_bacc_val, unf_bacc_test = fit_and_eval(unf_rows, unf_yrows, val_emb, y_val, test_emb, y_test_use)
+    bacc_val = bacc_test = float("nan")
+    if filt_rows.shape[0] > 0 and len(np.unique(filt_yrows)) > 1:
+        bacc_val, bacc_test = fit_and_eval(filt_rows, filt_yrows, val_emb, y_val, test_emb, y_test_use)
 
-    # ---------- phase 2: filtered cells (grid) ----------
-    per_cell = {}
-    for cs in grid_cs:
-        for K in grid_nc:
-            cell_cache_dir = make_cell_cache_dir(shared_cache_dir, cs, K)
-            print(f"[phase2] filtered cell cs={cs} nc={K} ...")
-            filt_rows, filt_yrows, stats = compute_cell_embeddings(
-                enc, model, sample_ids, y_sel, X_tr, y_tr, K, TABPFN_HIDDEN_DIM,
-                cs, args.seed, args.max_attempts, cell_cache_dir, with_unfiltered=False,
-            )
-            bacc_val = bacc_test = float("nan")
-            if filt_rows.shape[0] > 0 and len(np.unique(filt_yrows)) > 1:
-                bacc_val, bacc_test = fit_and_eval(filt_rows, filt_yrows, val_emb, y_val, test_emb, y_test_use)
-            per_cell[f"nc{K}_cs{_cs_str(cs)}"] = {
-                "num_contexts": K,
-                "context_size": cs,
-                "val_balanced_accuracy": bacc_val,
-                "balanced_accuracy": bacc_test,
-                "n_train_emb": int(filt_rows.shape[0]),
-                "n_queries_kept": stats["n_kept"],
-                "n_queries_dropped": stats["n_dropped"],
-                "mean_attempts_per_query": stats["mean_attempts_per_query"],
-                "acceptance_rate": stats["acceptance_rate"],
-            }
-
-    # ---------- select best cell by val balanced accuracy ----------
-    best_key = best = None
-    for key, cell in per_cell.items():
-        v = cell["val_balanced_accuracy"]
-        if v is not None and not math.isnan(v) and (best is None or v > best["val_balanced_accuracy"]):
-            best, best_key = cell, key
-
-    n_dropped = 0
-    n_kept = 0
     results = {
         "config": {
             "dataset": args.dataset,
@@ -495,64 +400,45 @@ def main():
             "train_size": int(N),
             "val_size": int(X_val.shape[0]),
             "test_size": int(X_test.shape[0]),
-            "grid_context_size": grid_cs,
-            "grid_num_contexts": grid_nc,
+            "context_size": cs,
+            "num_contexts": K,
         },
-        "per_cell": per_cell,
-        "best": {
-            "key": best_key,
-            "num_contexts": best["num_contexts"] if best else None,
-            "context_size": best["context_size"] if best else None,
-            "balanced_accuracy": best["balanced_accuracy"] if best else float("nan"),
-            "val_balanced_accuracy": best["val_balanced_accuracy"] if best else float("nan"),
-        },
-        "arms": {
-            "unfiltered": {
-                "num_contexts": anchor_nc,
-                "context_size": anchor_cs,
-                "val_balanced_accuracy": unf_bacc_val,
-                "balanced_accuracy": unf_bacc_test,
-                "n_train_emb": int(unf_rows.shape[0]) if unf_rows is not None else 0,
-                "n_queries": int(cap),
-            },
-            "filtered": {
-                "num_contexts": best["num_contexts"] if best else None,
-                "context_size": best["context_size"] if best else None,
-                "val_balanced_accuracy": best["val_balanced_accuracy"] if best else float("nan"),
-                "balanced_accuracy": best["balanced_accuracy"] if best else float("nan"),
-                "n_train_emb": best["n_train_emb"] if best else 0,
-                "n_queries_kept": best["n_queries_kept"] if best else 0,
-                "n_queries_dropped": best["n_queries_dropped"] if best else 0,
-                "mean_attempts_per_query": best["mean_attempts_per_query"] if best else float("nan"),
-                "acceptance_rate": best["acceptance_rate"] if best else float("nan"),
-            },
+        "filtered": {
+            "context_size": cs,
+            "num_contexts": K,
+            "val_balanced_accuracy": bacc_val,
+            "balanced_accuracy": bacc_test,
+            "n_train_emb": int(filt_rows.shape[0]),
+            "n_queries_kept": stats["n_kept"],
+            "n_queries_dropped": stats["n_dropped"],
+            "mean_attempts_per_query": stats["mean_attempts_per_query"],
+            "acceptance_rate": stats["acceptance_rate"],
         },
     }
 
-    cs_file = _cs_str(anchor_cs)
-    if is_grid:
-        out_name = f"label_filter_{args.dataset}_r{args.repeat_id}_grid.json"
+    if not args.no_json:
+        out_name = f"label_filter_{args.dataset}_r{args.repeat_id}_cs{_cs_str(cs)}_nc{K}.json"
+        out_path = os.path.join(out_dir, out_name)
+        with open(out_path, "w") as f:
+            json.dump(results, f, indent=2)
     else:
-        out_name = f"label_filter_{args.dataset}_r{args.repeat_id}_cs{cs_file}_nc{anchor_nc}.json"
-    out_path = os.path.join(out_dir, out_name)
-    with open(out_path, "w") as f:
-        json.dump(results, f, indent=2)
+        out_path = None
 
     # ---------- report ----------
-    u = results["arms"]["unfiltered"]
-    fl = results["arms"]["filtered"]
-    print("\n==== label-filter experiment (grid-search mode) ====")
-    print(f"  unfiltered (cs={u['context_size']}, nc={u['num_contexts']})  val={u['val_balanced_accuracy']:.4f}  "
-          f"test={u['balanced_accuracy']:.4f}  (n_emb={u['n_train_emb']})")
-    if best_key is not None:
-        print(f"  filtered   (cs={fl['context_size']}, nc={fl['num_contexts']})  val={fl['val_balanced_accuracy']:.4f}  "
-              f"test={fl['balanced_accuracy']:.4f}  (n_emb={fl['n_train_emb']}, kept={fl['n_queries_kept']}, "
-              f"dropped={fl['n_queries_dropped']}, mean_attempts={fl['mean_attempts_per_query']:.2f}, "
-              f"accept={fl['acceptance_rate']:.3f})")
-        print(f"  best cell selected by val: {best_key}")
-    else:
-        print("  filtered   no cell reached a usable downstream fit (all queries dropped).")
-    print(f"\n[out] wrote {out_path}")
+    fl = results["filtered"]
+    val_s = "nan" if math.isnan(bacc_val) else f"{bacc_val:.4f}"
+    test_s = "nan" if math.isnan(bacc_test) else f"{bacc_test:.4f}"
+    print("\n==== label-filter experiment (single cell) ====")
+    print(f"  filtered (cs={cs}, nc={K})  val={val_s}  test={test_s}  "
+          f"(n_emb={fl['n_train_emb']}, kept={fl['n_queries_kept']}, "
+          f"dropped={fl['n_queries_dropped']}, mean_attempts={fl['mean_attempts_per_query']:.2f}, "
+          f"accept={fl['acceptance_rate']:.3f})")
+    if out_path is not None:
+        print(f"[out] wrote {out_path}")
+
+    # Machine-parseable single line for run_label_filter.sh regardless of --no_json.
+    print(f"RESULT_FILTERED val={bacc_val} test={bacc_test} kept={stats['n_kept']} "
+          f"dropped={stats['n_dropped']}")
 
 
 if __name__ == "__main__":
