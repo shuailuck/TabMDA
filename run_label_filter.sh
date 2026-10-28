@@ -115,8 +115,11 @@ extract_metric() {
 
 # extract_kv: pull a key's value from the RESULT_FILTERED line, e.g.
 #   'RESULT_FILTERED val=0.7523 test=0.71 kept=20 dropped=5'
+# Anchored to the RESULT_FILTERED line so the [setup] line's val/test sizes
+# are not mistaken for the downstream accuracies.
 extract_kv() {
-    grep -oE "$2=[0-9.eE+-]+" "$1" 2>/dev/null | head -1 | grep -oE "[0-9.eE+-]+$"
+    grep -oE "RESULT_FILTERED .*" "$1" 2>/dev/null | head -1 \
+        | grep -oE "$2=[0-9.eE+-]+" | head -1 | grep -oE "[0-9.eE+-]+$"
 }
 
 # ---------------------------------------------------------------------------
